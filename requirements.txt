@@ -1,0 +1,28 @@
+# PhotoHunter Backend Requirements
+# Generated from pyproject.toml
+
+# Core Django
+Django==5.2.6
+djangorestframework==3.16.1
+django-cors-headers==4.9.0
+
+# Database
+psycopg2-binary==2.9.10
+
+# Image processing
+Pillow==11.3.0
+
+# AWS S3
+boto3==1.40.35
+
+# LangChain and AI
+langchain==0.3.27
+langchain-openai==0.3.33
+langchain-community==0.3.29
+
+# Environment
+python-dotenv==1.1.1
+
+# Other dependencies
+numpy==2.3.3
+requests==2.32.5
