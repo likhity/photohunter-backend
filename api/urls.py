@@ -19,6 +19,7 @@ urlpatterns = [
     # PhotoHunt endpoints
     path('photohunts/', views.PhotoHuntListCreateView.as_view(), name='photohunt-list-create'),
     path('photohunts/<uuid:pk>/', views.PhotoHuntDetailView.as_view(), name='photohunt-detail'),
+    path('photohunts/<uuid:pk>/download/', views.download_reference_image, name='photohunt-download'),
     path('photohunts/my/', views.UserPhotoHuntsView.as_view(), name='user-photohunts'),
     path('photohunts/nearby/', views.nearby_photohunts, name='nearby-photohunts'),
     

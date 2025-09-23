@@ -18,6 +18,10 @@ class S3Service:
             region_name=settings.AWS_S3_REGION_NAME
         )
         self.bucket_name = settings.AWS_STORAGE_BUCKET_NAME
+        # Prefer explicit custom domain; otherwise use region-specific S3 endpoint
+        region = settings.AWS_S3_REGION_NAME
+        default_domain = f"{self.bucket_name}.s3.{region}.amazonaws.com" if region else f"{self.bucket_name}.s3.amazonaws.com"
+        self.public_base_domain = getattr(settings, 'AWS_S3_CUSTOM_DOMAIN', '') or default_domain
     
     def upload_file(self, file_obj, folder='images', file_extension='jpg'):
         """
@@ -35,24 +39,105 @@ class S3Service:
             # Generate unique filename
             filename = f"{folder}/{uuid.uuid4()}.{file_extension}"
             
-            # Upload file
-            self.s3_client.upload_fileobj(
-                file_obj,
-                self.bucket_name,
-                filename,
-                ExtraArgs={
-                    'ACL': settings.AWS_DEFAULT_ACL,
-                    'ContentType': f'image/{file_extension}',
-                    **settings.AWS_S3_OBJECT_PARAMETERS
-                }
-            )
+            # Ensure we have reusable bytes for multiple attempts
+            import io
+            try:
+                # Try to read all bytes from provided file-like
+                if hasattr(file_obj, 'seek'):
+                    try:
+                        file_obj.seek(0)
+                    except Exception:
+                        pass
+                file_bytes = file_obj.read()
+                if file_bytes is None:
+                    file_bytes = b''
+            except Exception:
+                # As a last resort, treat it as empty stream
+                file_bytes = b''
+
+            # Prepare ExtraArgs
+            base_extra_args = {
+                'ContentType': f'image/{file_extension}',
+                **getattr(settings, 'AWS_S3_OBJECT_PARAMETERS', {})
+            }
+
+            # Try with ACL if configured
+            acl_value = getattr(settings, 'AWS_DEFAULT_ACL', None)
+            tried_without_acl = False
+            # Best-effort determine file size for logging
+            file_size = None
+            try:
+                file_size = len(file_bytes)
+            except Exception:
+                pass
+            try:
+                extra_args = dict(base_extra_args)
+                if acl_value:
+                    extra_args['ACL'] = acl_value
+                first_buffer = io.BytesIO(file_bytes)
+                self.s3_client.upload_fileobj(
+                    first_buffer,
+                    self.bucket_name,
+                    filename,
+                    ExtraArgs=extra_args
+                )
+            except ClientError as e:
+                # If bucket blocks public ACLs or ACL isn't permitted, retry without ACL
+                error_code = e.response.get('Error', {}).get('Code', '')
+                if acl_value and error_code in {
+                    'AccessDenied',
+                    'InvalidRequest',
+                    'AccessControlListNotSupported',
+                    'InvalidBucketAclWithObjectOwnership',
+                }:
+                    tried_without_acl = True
+                    # Recreate a fresh buffer for retry
+                    retry_buffer = io.BytesIO(file_bytes)
+                    try:
+                        self.s3_client.upload_fileobj(
+                            retry_buffer,
+                            self.bucket_name,
+                            filename,
+                            ExtraArgs=base_extra_args
+                        )
+                    except ClientError as e2:
+                        raise
+                else:
+                    raise
             
             # Return public URL
-            return f"https://{settings.AWS_S3_CUSTOM_DOMAIN}/{filename}"
-            
+            return f"https://{self.public_base_domain}/{filename}"
         except ClientError as e:
             logger.error(f"Error uploading file to S3: {e}")
             raise Exception("Failed to upload file to S3")
+        except Exception as e:
+            logger.error(f"Unexpected error during S3 upload: {e}")
+            raise Exception("Failed to upload file to S3")
+
+    def generate_presigned_get_url(self, key: str, expiration: int = 900) -> str:
+        """Generate a presigned GET URL for an S3 object key."""
+        try:
+            return self.s3_client.generate_presigned_url(
+                'get_object',
+                Params={'Bucket': self.bucket_name, 'Key': key},
+                ExpiresIn=expiration,
+            )
+        except ClientError as e:
+            logger.error(f"Error generating presigned URL: {e}")
+            raise Exception("Failed to generate presigned URL")
+
+    def extract_key_from_url(self, url: str) -> str:
+        """Extract S3 key from a URL that uses the configured public domain."""
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            path = parsed.path or ''
+            if path.startswith('/'):
+                path = path[1:]
+            return path
+        except Exception:
+            return url
+        
     
     def upload_base64_image(self, base64_data, folder='images', file_extension='jpg'):
         """

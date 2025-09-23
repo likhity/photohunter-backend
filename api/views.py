@@ -10,6 +10,7 @@ from django.db.models import Q
 from django.utils import timezone
 # CSRF is disabled via middleware for API endpoints
 import uuid
+from django.shortcuts import redirect
 
 from .models import User, PhotoHunt, PhotoHuntCompletion, PhotoValidation, UserProfile
 from .serializers import (
@@ -138,6 +139,36 @@ class PhotoHuntCompletionsView(generics.ListAPIView):
             user=self.request.user
         ).order_by('-created_at')
 
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def download_reference_image(request, pk):
+    """Return a redirect to a presigned URL (S3) or local media URL."""
+    try:
+        photohunt = PhotoHunt.objects.get(id=pk, is_active=True)
+    except PhotoHunt.DoesNotExist:
+        return Response({'error': 'PhotoHunt not found'}, status=status.HTTP_404_NOT_FOUND)
+
+    if not photohunt.reference_image:
+        return Response({'error': 'No reference image available'}, status=status.HTTP_404_NOT_FOUND)
+
+    image_url = photohunt.reference_image
+
+    # If we stored an S3 URL, generate a presigned URL
+    if image_url.startswith('http://') or image_url.startswith('https://'):
+        from .services.s3_service import S3Service
+        s3 = S3Service()
+        key = s3.extract_key_from_url(image_url)
+        try:
+            presigned = s3.generate_presigned_get_url(key, expiration=900)
+            return redirect(presigned)
+        except Exception:
+            # As a fallback, still try redirecting to the stored URL
+            return redirect(image_url)
+
+    # Otherwise assume it's a local media URL like /media/...
+    absolute_url = request.build_absolute_uri(image_url)
+    return redirect(absolute_url)
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])

@@ -143,11 +143,28 @@ class PhotoHuntCreateSerializer(serializers.ModelSerializer):
             if file_extension not in ['jpg', 'jpeg', 'png', 'gif', 'webp']:
                 raise serializers.ValidationError("Unsupported file format. Please use JPG, PNG, GIF, or WebP.")
             
+            # Read file bytes once so we can safely retry and/or fall back to local storage
+            import io
+            try:
+                if hasattr(file_obj, 'seek'):
+                    file_obj.seek(0)
+            except Exception:
+                pass
+            file_bytes = file_obj.read()
+            if file_bytes is None:
+                file_bytes = b''
+            s3_buffer = io.BytesIO(file_bytes)
+
             # Upload to S3
             from .services.s3_service import S3Service
             s3_service = S3Service()
             try:
-                s3_url = s3_service.upload_file(file_obj, folder='photohunts', file_extension=file_extension)
+                # Ensure buffer is at start before upload
+                try:
+                    s3_buffer.seek(0)
+                except Exception:
+                    s3_buffer = io.BytesIO(file_bytes)
+                s3_url = s3_service.upload_file(s3_buffer, folder='photohunts', file_extension=file_extension)
                 validated_data['reference_image'] = s3_url
             except Exception as e:
                 # Fallback to local storage for development
@@ -164,15 +181,24 @@ class PhotoHuntCreateSerializer(serializers.ModelSerializer):
                 file_path = os.path.join(media_dir, filename)
                 
                 # Save file locally
-                with open(file_path, 'wb') as f:
-                    for chunk in file_obj.chunks():
-                        f.write(chunk)
+                try:
+                    with open(file_path, 'wb') as f:
+                        f.write(file_bytes)
+                except Exception as write_err:
+                    raise serializers.ValidationError(
+                        { 'non_field_errors': [f'Failed to persist image locally: {str(write_err)}'] }
+                    )
                 
                 # Create URL for local file
                 local_url = f"{settings.MEDIA_URL}photohunts/{filename}"
                 validated_data['reference_image'] = local_url
-        
-        return super().create(validated_data)
+        try:
+            return super().create(validated_data)
+        except Exception as e:
+            # Surface clean error to client; check server logs for full traceback
+            raise serializers.ValidationError({
+                'non_field_errors': [f'Failed to create PhotoHunt: {str(e)}']
+            })
 
 
 class PhotoHuntCompletionSerializer(serializers.ModelSerializer):
