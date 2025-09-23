@@ -88,13 +88,90 @@ class PhotoHuntSerializer(serializers.ModelSerializer):
 
 
 class PhotoHuntCreateSerializer(serializers.ModelSerializer):
-    """Serializer for creating PhotoHunt"""
+    """Serializer for creating PhotoHunt with file upload support"""
+    reference_image_file = serializers.ImageField(required=False, write_only=True)
+    reference_image = serializers.URLField(required=False, write_only=True)
+    # Support both field names for frontend compatibility
+    lat = serializers.DecimalField(max_digits=20, decimal_places=15, write_only=True, required=True)
+    long = serializers.DecimalField(max_digits=20, decimal_places=15, write_only=True, required=True)
+    
     class Meta:
         model = PhotoHunt
-        fields = ['name', 'description', 'latitude', 'longitude', 'reference_image']
+        fields = ['name', 'description', 'lat', 'long', 'reference_image', 'reference_image_file']
+    
+    def validate(self, attrs):
+        # Map lat/long to latitude/longitude if provided
+        if 'lat' in attrs and attrs['lat'] is not None:
+            attrs['latitude'] = attrs.pop('lat')
+        if 'long' in attrs and attrs['long'] is not None:
+            attrs['longitude'] = attrs.pop('long')
+        
+        # Handle reference image validation
+        has_file = 'reference_image_file' in attrs and attrs['reference_image_file'] is not None
+        has_url = 'reference_image' in attrs and attrs['reference_image'] is not None and attrs['reference_image'] != 'Present'
+        
+        # If reference_image is "Present", it means the frontend is indicating a file should be uploaded
+        # but the actual file is in reference_image_file
+        if 'reference_image' in attrs and attrs['reference_image'] == 'Present':
+            attrs.pop('reference_image')  # Remove the "Present" string
+            has_url = False
+        
+        # If no file and no valid URL, but we have a "Present" indicator, that's okay
+        # The frontend should be sending the file via reference_image_file
+        if not has_file and not has_url:
+            # Check if this is a multipart request with a file
+            if hasattr(self.context.get('request'), 'FILES') and 'reference_image_file' in self.context['request'].FILES:
+                has_file = True
+                attrs['reference_image_file'] = self.context['request'].FILES['reference_image_file']
+        
+        if not has_file and not has_url:
+            raise serializers.ValidationError("Either reference_image_file or reference_image must be provided")
+        
+        if has_file and has_url:
+            raise serializers.ValidationError("Provide either reference_image_file or reference_image, not both")
+        
+        return attrs
     
     def create(self, validated_data):
         validated_data['created_by'] = self.context['request'].user
+        
+        # Handle file upload - upload to S3 and get URL
+        if 'reference_image_file' in validated_data:
+            file_obj = validated_data.pop('reference_image_file')
+            # Get file extension
+            file_extension = file_obj.name.split('.')[-1].lower()
+            if file_extension not in ['jpg', 'jpeg', 'png', 'gif', 'webp']:
+                raise serializers.ValidationError("Unsupported file format. Please use JPG, PNG, GIF, or WebP.")
+            
+            # Upload to S3
+            from .services.s3_service import S3Service
+            s3_service = S3Service()
+            try:
+                s3_url = s3_service.upload_file(file_obj, folder='photohunts', file_extension=file_extension)
+                validated_data['reference_image'] = s3_url
+            except Exception as e:
+                # Fallback to local storage for development
+                import os
+                import uuid
+                from django.conf import settings
+                
+                # Create media directory if it doesn't exist
+                media_dir = os.path.join(settings.MEDIA_ROOT, 'photohunts')
+                os.makedirs(media_dir, exist_ok=True)
+                
+                # Generate unique filename
+                filename = f"{uuid.uuid4()}.{file_extension}"
+                file_path = os.path.join(media_dir, filename)
+                
+                # Save file locally
+                with open(file_path, 'wb') as f:
+                    for chunk in file_obj.chunks():
+                        f.write(chunk)
+                
+                # Create URL for local file
+                local_url = f"{settings.MEDIA_URL}photohunts/{filename}"
+                validated_data['reference_image'] = local_url
+        
         return super().create(validated_data)
 
 
