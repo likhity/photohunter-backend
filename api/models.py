@@ -27,8 +27,8 @@ class PhotoHunt(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=255)
     description = models.TextField()
-    latitude = models.DecimalField(max_digits=10, decimal_places=7)
-    longitude = models.DecimalField(max_digits=10, decimal_places=7)
+    latitude = models.DecimalField(max_digits=20, decimal_places=15)
+    longitude = models.DecimalField(max_digits=20, decimal_places=15)
     reference_image = models.URLField(max_length=500, null=True, blank=True)  # S3 URL
     created_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='created_photohunts')
     is_user_generated = models.BooleanField(default=True)

@@ -102,8 +102,6 @@ class PhotoHuntListCreateView(generics.ListCreateAPIView):
         
         return queryset.order_by('-created_at')
     
-    def perform_create(self, serializer):
-        serializer.save(created_by=self.request.user)
 
 
 class PhotoHuntDetailView(generics.RetrieveUpdateDestroyAPIView):
