@@ -189,12 +189,7 @@ def submit_photo(request):
             status=status.HTTP_404_NOT_FOUND
         )
     
-    # Check if user already completed this hunt
-    if PhotoHuntCompletion.objects.filter(user=request.user, photohunt=photohunt).exists():
-        return Response(
-            {'error': 'You have already completed this PhotoHunt'}, 
-            status=status.HTTP_400_BAD_REQUEST
-        )
+    # Allow retries even if previously completed; we'll replace on success
     
     # Validate file format
     file_extension = photo_file.name.split('.')[-1].lower()
@@ -258,13 +253,6 @@ def submit_photo(request):
         except Exception:
             submitted_presigned_url = submitted_image_url
     
-    # Create completion record
-    completion = PhotoHuntCompletion.objects.create(
-        user=request.user,
-        photohunt=photohunt,
-        submitted_image=submitted_image_url
-    )
-    
     # Prepare a presigned URL for the reference image as well
     reference_image_url = photohunt.reference_image
     try:
@@ -284,41 +272,123 @@ def submit_photo(request):
         photohunt_description=photohunt.description
     )
 
+    # If validation failed, delete uploaded image and allow retry
+    if not validation_result.get('is_valid', False):
+        try:
+            if submitted_image_url.startswith('http://') or submitted_image_url.startswith('https://'):
+                try:
+                    key = s3_service.extract_key_from_url(submitted_image_url)
+                    if key:
+                        s3_service.s3_client.delete_object(Bucket=s3_service.bucket_name, Key=key)
+                except Exception:
+                    pass
+            else:
+                try:
+                    # Remove local file if present
+                    import os
+                    from django.conf import settings
+                    rel = submitted_image_url.replace(settings.MEDIA_URL, '')
+                    local_path = os.path.join(settings.MEDIA_ROOT, rel)
+                    if os.path.exists(local_path):
+                        os.remove(local_path)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Strip any signed URLs from response payload
+        try:
+            validation_result.pop('reference_image_url', None)
+            validation_result.pop('submitted_image_url', None)
+        except Exception:
+            pass
+
+        return Response({'validation': validation_result}, status=status.HTTP_200_OK)
+
+    # Successful validation: update existing completion or create new
+    existing_completion = PhotoHuntCompletion.objects.filter(user=request.user, photohunt=photohunt).first()
+    previously_valid = bool(existing_completion and existing_completion.is_valid)
+    old_image_url = existing_completion.submitted_image if existing_completion else None
+
+    if existing_completion:
+        existing_completion.submitted_image = submitted_image_url
+        existing_completion.is_valid = True
+        existing_completion.validation_score = validation_result['similarity_score']
+        existing_completion.validation_notes = validation_result.get('notes', '')
+        existing_completion.save()
+        completion = existing_completion
+    else:
+        completion = PhotoHuntCompletion.objects.create(
+            user=request.user,
+            photohunt=photohunt,
+            submitted_image=submitted_image_url,
+            is_valid=True,
+            validation_score=validation_result['similarity_score'],
+            validation_notes=validation_result.get('notes', '')
+        )
+
+    # If replacing an older submission, delete the old object from storage
+    try:
+        if old_image_url and old_image_url != submitted_image_url:
+            if old_image_url.startswith('http://') or old_image_url.startswith('https://'):
+                try:
+                    old_key = s3_service.extract_key_from_url(old_image_url)
+                    if old_key:
+                        s3_service.s3_client.delete_object(Bucket=s3_service.bucket_name, Key=old_key)
+                except Exception:
+                    pass
+            else:
+                try:
+                    import os
+                    from django.conf import settings
+                    rel_old = old_image_url.replace(settings.MEDIA_URL, '')
+                    local_old_path = os.path.join(settings.MEDIA_ROOT, rel_old)
+                    if os.path.exists(local_old_path):
+                        os.remove(local_old_path)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
     # Do not expose signed URLs in the API response
     try:
         validation_result.pop('reference_image_url', None)
         validation_result.pop('submitted_image_url', None)
     except Exception:
         pass
-    
-    # Update completion with validation results
-    completion.validation_score = validation_result['similarity_score']
-    completion.is_valid = validation_result['is_valid']
-    completion.validation_notes = validation_result['notes']
-    completion.save()
-    
-    # Create validation record (store non-signed, durable URLs)
-    PhotoValidation.objects.create(
-        completion=completion,
-        reference_image_url=photohunt.reference_image,
-        submitted_image_url=submitted_image_url,
-        similarity_score=validation_result['similarity_score'],
-        confidence_score=validation_result['confidence_score'],
-        validation_prompt=validation_result['prompt'],
-        ai_response=validation_result['ai_response'],
-        is_approved=validation_result['is_valid']
-    )
-    
+
+    # Create or update validation record (store non-signed, durable URLs)
+    from django.db import transaction
+    with transaction.atomic():
+        validation_obj, _ = PhotoValidation.objects.select_for_update().get_or_create(
+            completion=completion,
+            defaults={
+                'reference_image_url': photohunt.reference_image,
+                'submitted_image_url': submitted_image_url,
+                'similarity_score': validation_result['similarity_score'],
+                'confidence_score': validation_result['confidence_score'],
+                'validation_prompt': validation_result['prompt'],
+                'ai_response': validation_result['ai_response'],
+                'is_approved': True
+            }
+        )
+        if validation_obj and validation_obj.pk:
+            validation_obj.reference_image_url = photohunt.reference_image
+            validation_obj.submitted_image_url = submitted_image_url
+            validation_obj.similarity_score = validation_result['similarity_score']
+            validation_obj.confidence_score = validation_result['confidence_score']
+            validation_obj.validation_prompt = validation_result['prompt']
+            validation_obj.ai_response = validation_result['ai_response']
+            validation_obj.is_approved = True
+            validation_obj.save()
+
     # Update user profile stats
     profile, created = UserProfile.objects.get_or_create(user=request.user)
-    if completion.is_valid:
+    if not previously_valid:
         profile.total_completions += 1
         profile.save()
-    
-    return Response({
-        'completion': PhotoHuntCompletionSerializer(completion).data,
-        'validation': validation_result
-    }, status=status.HTTP_201_CREATED)
+
+    return Response({'completion': PhotoHuntCompletionSerializer(completion).data, 'validation': validation_result}, status=status.HTTP_201_CREATED)
 
 
 @api_view(['GET'])

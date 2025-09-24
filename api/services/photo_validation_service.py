@@ -112,6 +112,7 @@ class PhotoValidationService:
                     "2. Are the architectural features, landmarks, or key elements the same?\n"
                     "3. Is the lighting, angle, or perspective similar enough to confirm it's the same place?\n"
                     "4. Are there any obvious differences that suggest they're different locations?\n"
+                    "Do NOT talk about the first image in any part of your response including the notes, as your response will be sent back to the client. Its details are meant to be a secret."
                 )
             },
             {
@@ -126,17 +127,17 @@ class PhotoValidationService:
                 "type": "text",
                 "text": (
                     f"PHOTO HUNT DESCRIPTION: {description}\n\n"
-                    "Respond in the following JSON format:\n"
+                    "Respond in the following JSON format (Do NOT talk about the reference image in any part of your response including the notes, as your response will be sent back to the client. Its details are meant to be a secret.):\n"
                     "{\n"
                     '    "similarity_score": 0.85,  // Score from 0.0 to 1.0 (1.0 = identical)\n'
                     '    "confidence_score": 0.92,  // Your confidence in the assessment (0.0 to 1.0)\n'
                     '    "is_valid": true,          // Whether the submitted photo matches the reference\n'
                     '    "notes": "The images show the same architectural landmark with similar lighting and angle. '
-                    'The key features match the description perfectly.",\n'
+                    'The key features match the description perfectly. Do NOT talk about the reference image in any part of your response including the notes, as your response will be sent back to the client. Its details are meant to be a secret.",\n'
                     '    "key_matches": ["Gothic architecture", "Stained glass windows", "Flying buttresses"],\n'
                     '    "key_differences": ["Slight difference in lighting", "Different time of day"]\n'
                     "}\n\n"
-                    "Be strict but fair in your assessment. The photo should clearly show the same subject/location as the reference image."
+                    "Be strict but fair in your assessment. The photo should clearly show the same subject/location as the reference image. Do NOT talk about the reference image in any part of your response including the notes, as your response will be sent back to the client. Its details are meant to be a secret."
                 )
             }
         ]
