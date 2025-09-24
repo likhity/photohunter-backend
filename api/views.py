@@ -173,13 +173,13 @@ def download_reference_image(request, pk):
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def submit_photo(request):
-    """Submit a photo for PhotoHunt validation"""
+    """Submit a photo for PhotoHunt validation using multipart form data"""
     serializer = PhotoSubmissionSerializer(data=request.data)
     if not serializer.is_valid():
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
     
     photohunt_id = serializer.validated_data['photohunt_id']
-    image_url = serializer.validated_data['image_url']
+    photo_file = serializer.validated_data['photo']
     
     try:
         photohunt = PhotoHunt.objects.get(id=photohunt_id, is_active=True)
@@ -196,20 +196,100 @@ def submit_photo(request):
             status=status.HTTP_400_BAD_REQUEST
         )
     
+    # Validate file format
+    file_extension = photo_file.name.split('.')[-1].lower()
+    if file_extension not in ['jpg', 'jpeg', 'png', 'gif', 'webp']:
+        return Response(
+            {'error': 'Unsupported file format. Please use JPG, PNG, GIF, or WebP.'}, 
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    
+    # Read file bytes for AI validation
+    try:
+        if hasattr(photo_file, 'seek'):
+            photo_file.seek(0)
+    except Exception:
+        pass
+    submitted_image_bytes = photo_file.read()
+    
+    # Upload to S3
+    from .services.s3_service import S3Service
+    s3_service = S3Service()
+    try:
+        # Reset file pointer for upload
+        photo_file.seek(0)
+        submitted_image_url = s3_service.upload_file(photo_file, folder='submissions', file_extension=file_extension)
+        # Generate a presigned GET URL for the validator to fetch the image
+        try:
+            submitted_key = s3_service.extract_key_from_url(submitted_image_url)
+            submitted_presigned_url = s3_service.generate_presigned_get_url(submitted_key, expiration=900)
+        except Exception:
+            # Fallback to using the public URL if presign fails
+            submitted_presigned_url = submitted_image_url
+    except Exception as e:
+        # Fallback to local storage for development
+        import os
+        import uuid
+        from django.conf import settings
+        
+        # Create media directory if it doesn't exist
+        media_dir = os.path.join(settings.MEDIA_ROOT, 'submissions')
+        os.makedirs(media_dir, exist_ok=True)
+        
+        # Generate unique filename
+        filename = f"{uuid.uuid4()}.{file_extension}"
+        file_path = os.path.join(media_dir, filename)
+        
+        # Save file locally
+        try:
+            with open(file_path, 'wb') as f:
+                f.write(submitted_image_bytes)
+        except Exception as write_err:
+            return Response(
+                {'error': f'Failed to save image: {str(write_err)}'}, 
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+        
+        # Create URL for local file
+        submitted_image_url = f"{settings.MEDIA_URL}submissions/{filename}"
+        # Build absolute URL for validator to fetch
+        try:
+            submitted_presigned_url = request.build_absolute_uri(submitted_image_url)
+        except Exception:
+            submitted_presigned_url = submitted_image_url
+    
     # Create completion record
     completion = PhotoHuntCompletion.objects.create(
         user=request.user,
         photohunt=photohunt,
-        submitted_image=image_url
+        submitted_image=submitted_image_url
     )
     
-    # Validate photo using AI
+    # Prepare a presigned URL for the reference image as well
+    reference_image_url = photohunt.reference_image
+    try:
+        if reference_image_url and (reference_image_url.startswith('http://') or reference_image_url.startswith('https://')):
+            ref_key = s3_service.extract_key_from_url(reference_image_url)
+            reference_presigned_url = s3_service.generate_presigned_get_url(ref_key, expiration=900)
+        else:
+            reference_presigned_url = request.build_absolute_uri(reference_image_url)
+    except Exception:
+        reference_presigned_url = reference_image_url
+
+    # Validate photo using AI with presigned URLs for both images
     validation_service = PhotoValidationService()
     validation_result = validation_service.validate_photo(
-        reference_image_url=photohunt.reference_image,
-        submitted_image_url=image_url,
+        reference_image_url=reference_presigned_url,
+        submitted_image_url=submitted_presigned_url,
         photohunt_description=photohunt.description
     )
+
+    # Do not expose signed URLs in the API response
+    try:
+        validation_result.pop('reference_image_url', None)
+        validation_result.pop('submitted_image_url', None)
+    except Exception:
+        pass
     
     # Update completion with validation results
     completion.validation_score = validation_result['similarity_score']
@@ -217,11 +297,11 @@ def submit_photo(request):
     completion.validation_notes = validation_result['notes']
     completion.save()
     
-    # Create validation record
+    # Create validation record (store non-signed, durable URLs)
     PhotoValidation.objects.create(
         completion=completion,
         reference_image_url=photohunt.reference_image,
-        submitted_image_url=image_url,
+        submitted_image_url=submitted_image_url,
         similarity_score=validation_result['similarity_score'],
         confidence_score=validation_result['confidence_score'],
         validation_prompt=validation_result['prompt'],

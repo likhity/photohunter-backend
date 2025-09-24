@@ -242,9 +242,9 @@ class UserProfileSerializer(serializers.ModelSerializer):
 
 
 class PhotoSubmissionSerializer(serializers.Serializer):
-    """Serializer for photo submission and validation"""
+    """Serializer for photo submission with multipart form data"""
     photohunt_id = serializers.UUIDField()
-    image_url = serializers.URLField()
+    photo = serializers.ImageField()
     
     def validate_photohunt_id(self, value):
         try:

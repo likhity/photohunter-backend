@@ -1,5 +1,7 @@
 import os
 import requests
+import base64
+import io
 from django.conf import settings
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
@@ -33,10 +35,47 @@ class PhotoValidationService:
             dict: Validation results including similarity score, confidence, and notes
         """
         try:
-            # Create the validation prompt
-            prompt = self._create_validation_prompt(
+            message_content = self._create_validation_prompt(
+                reference_image_url,
+                submitted_image_url,
+                photohunt_description
+            )
+
+            response = self.llm.invoke([HumanMessage(content=message_content)])
+            validation_result = self._parse_ai_response(response.content)
+
+            validation_result.update({
+                "prompt": message_content,
+                "ai_response": response.content,
+                "reference_image_url": reference_image_url,
+                "submitted_image_url": submitted_image_url
+            })
+            return validation_result
+
+        except Exception as e:
+            logger.error(f"Error validating photo: {e}")
+            return self._get_fallback_response(reference_image_url, submitted_image_url)
+    
+    def validate_photo_with_bytes(self, reference_image_url, submitted_image_bytes, photohunt_description):
+        """
+        Validate a submitted photo (as bytes) against a reference photo using AI
+        
+        Args:
+            reference_image_url: URL of the reference image
+            submitted_image_bytes: Bytes of the submitted image
+            photohunt_description: Description of what should be photographed
+        
+        Returns:
+            dict: Validation results including similarity score, confidence, and notes
+        """
+        try:
+            # Convert image bytes to base64 for the LLM
+            image_base64 = base64.b64encode(submitted_image_bytes).decode('utf-8')
+            
+            # Create the validation prompt with base64 image
+            prompt = self._create_validation_prompt_with_bytes(
                 reference_image_url, 
-                submitted_image_url, 
+                image_base64, 
                 photohunt_description
             )
             
@@ -51,22 +90,64 @@ class PhotoValidationService:
                 'prompt': prompt,
                 'ai_response': response.content,
                 'reference_image_url': reference_image_url,
-                'submitted_image_url': submitted_image_url
+                'submitted_image_bytes': True  # Indicate we used bytes instead of URL
             })
             
             return validation_result
             
         except Exception as e:
-            logger.error(f"Error validating photo: {e}")
-            return self._get_fallback_response(reference_image_url, submitted_image_url)
+            logger.error(f"Error validating photo with bytes: {e}")
+            return self._get_fallback_response(reference_image_url, None)
     
     def _create_validation_prompt(self, reference_image_url, submitted_image_url, description):
-        """Create the prompt for photo validation"""
+        """Create a multimodal prompt preserving the full original instructions."""
+        return [
+            {
+                "type": "text",
+                "text": (
+                    "You are an expert photo validation AI. Your task is to compare two images "
+                    "and determine if they show the same subject or location.\n\n"
+                    "Please analyze both images and provide a detailed comparison. Consider:\n"
+                    "1. Are they showing the same subject/location?\n"
+                    "2. Are the architectural features, landmarks, or key elements the same?\n"
+                    "3. Is the lighting, angle, or perspective similar enough to confirm it's the same place?\n"
+                    "4. Are there any obvious differences that suggest they're different locations?\n"
+                )
+            },
+            {
+                "type": "image_url",
+                "image_url": {"url": reference_image_url}
+            },
+            {
+                "type": "image_url",
+                "image_url": {"url": submitted_image_url}
+            },
+            {
+                "type": "text",
+                "text": (
+                    f"PHOTO HUNT DESCRIPTION: {description}\n\n"
+                    "Respond in the following JSON format:\n"
+                    "{\n"
+                    '    "similarity_score": 0.85,  // Score from 0.0 to 1.0 (1.0 = identical)\n'
+                    '    "confidence_score": 0.92,  // Your confidence in the assessment (0.0 to 1.0)\n'
+                    '    "is_valid": true,          // Whether the submitted photo matches the reference\n'
+                    '    "notes": "The images show the same architectural landmark with similar lighting and angle. '
+                    'The key features match the description perfectly.",\n'
+                    '    "key_matches": ["Gothic architecture", "Stained glass windows", "Flying buttresses"],\n'
+                    '    "key_differences": ["Slight difference in lighting", "Different time of day"]\n'
+                    "}\n\n"
+                    "Be strict but fair in your assessment. The photo should clearly show the same subject/location as the reference image."
+                )
+            }
+        ]
+    
+    def _create_validation_prompt_with_bytes(self, reference_image_url, submitted_image_base64, description):
+        """Create the prompt for photo validation with base64 image"""
         return f"""
 You are an expert photo validation AI. Your task is to compare two images and determine if they show the same subject or location.
 
 REFERENCE IMAGE: {reference_image_url}
-SUBMITTED IMAGE: {submitted_image_url}
+SUBMITTED IMAGE (base64): data:image/jpeg;base64,{submitted_image_base64}
 PHOTO HUNT DESCRIPTION: {description}
 
 Please analyze both images and provide a detailed comparison. Consider:
