@@ -32,6 +32,9 @@ urlpatterns = [
     # User profile
     path('profile/', views.user_profile, name='user-profile'),
     path('profile/update/', views.update_profile, name='update-profile'),
+    path('profile/change-password/', views.change_password, name='change-password'),
+    path('profile/delete-account/', views.delete_account, name='delete-account'),
+    path('users/<uuid:user_id>/profile/', views.public_user_profile, name='public-user-profile'),
     
     # Include router URLs
     path('', include(router.urls)),

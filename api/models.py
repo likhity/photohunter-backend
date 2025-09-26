@@ -30,6 +30,8 @@ class PhotoHunt(models.Model):
     latitude = models.DecimalField(max_digits=20, decimal_places=15)
     longitude = models.DecimalField(max_digits=20, decimal_places=15)
     reference_image = models.URLField(max_length=500, null=True, blank=True)  # S3 URL
+    difficulty = models.FloatField(null=True, blank=True, help_text="Difficulty level out of 5")
+    hint = models.TextField(blank=True, help_text="Optional hint for the photo hunt")
     created_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='created_photohunts')
     is_user_generated = models.BooleanField(default=True)
     is_active = models.BooleanField(default=True)

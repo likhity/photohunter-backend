@@ -16,7 +16,8 @@ from .models import User, PhotoHunt, PhotoHuntCompletion, PhotoValidation, UserP
 from .serializers import (
     UserSerializer, UserRegistrationSerializer, UserLoginSerializer,
     PhotoHuntSerializer, PhotoHuntCreateSerializer, PhotoHuntCompletionSerializer,
-    PhotoValidationSerializer, UserProfileSerializer, PhotoSubmissionSerializer
+    PhotoValidationSerializer, UserProfileSerializer, PhotoSubmissionSerializer,
+    ChangePasswordSerializer, PublicUserProfileSerializer
 )
 from .services.photo_validation_service import PhotoValidationService
 from .services.s3_service import S3Service
@@ -115,6 +116,78 @@ class PhotoHuntDetailView(generics.RetrieveUpdateDestroyAPIView):
         if self.request.method in ['PUT', 'PATCH']:
             return PhotoHuntCreateSerializer
         return PhotoHuntSerializer
+    
+    def get_object(self):
+        """Override to ensure user can only modify their own PhotoHunts"""
+        obj = super().get_object()
+        if self.request.method in ['PUT', 'PATCH', 'DELETE'] and obj.created_by != self.request.user:
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("You can only modify your own PhotoHunts")
+        return obj
+    
+    def perform_update(self, serializer):
+        """Handle PhotoHunt updates with image replacement"""
+        instance = self.get_object()
+        old_image_url = instance.reference_image
+        
+        # Save the updated instance
+        updated_instance = serializer.save()
+        
+        # If reference image changed, delete old one from S3
+        if old_image_url and old_image_url != updated_instance.reference_image:
+            if old_image_url.startswith('http://') or old_image_url.startswith('https://'):
+                try:
+                    from .services.s3_service import S3Service
+                    s3_service = S3Service()
+                    old_key = s3_service.extract_key_from_url(old_image_url)
+                    if old_key:
+                        s3_service.s3_client.delete_object(Bucket=s3_service.bucket_name, Key=old_key)
+                except Exception:
+                    pass  # Continue even if deletion fails
+    
+    def perform_destroy(self, instance):
+        """Handle PhotoHunt deletion with cascade cleanup"""
+        from .services.s3_service import S3Service
+        s3_service = S3Service()
+        
+        # Collect all S3 objects to delete
+        s3_objects_to_delete = []
+        
+        # Add reference image
+        if instance.reference_image and (instance.reference_image.startswith('http://') or instance.reference_image.startswith('https://')):
+            try:
+                key = s3_service.extract_key_from_url(instance.reference_image)
+                if key:
+                    s3_objects_to_delete.append(key)
+            except Exception:
+                pass
+        
+        # Add all completion images for this PhotoHunt
+        completions = PhotoHuntCompletion.objects.filter(photohunt=instance)
+        for completion in completions:
+            if completion.submitted_image and (completion.submitted_image.startswith('http://') or completion.submitted_image.startswith('https://')):
+                try:
+                    key = s3_service.extract_key_from_url(completion.submitted_image)
+                    if key:
+                        s3_objects_to_delete.append(key)
+                except Exception:
+                    pass
+        
+        # Delete S3 objects
+        if s3_objects_to_delete:
+            try:
+                # Remove duplicates
+                s3_objects_to_delete = list(set(s3_objects_to_delete))
+                for key in s3_objects_to_delete:
+                    try:
+                        s3_service.s3_client.delete_object(Bucket=s3_service.bucket_name, Key=key)
+                    except Exception:
+                        pass  # Continue even if individual deletions fail
+            except Exception:
+                pass  # Continue even if S3 cleanup fails
+        
+        # Delete the PhotoHunt (cascade will handle completions and validations)
+        instance.delete()
 
 
 class UserPhotoHuntsView(generics.ListAPIView):
@@ -397,13 +470,16 @@ def user_profile(request):
     """Get current user's profile"""
     try:
         profile = request.user.profile
-        serializer = UserProfileSerializer(profile)
-        return Response(serializer.data)
     except UserProfile.DoesNotExist:
         # Create profile if it doesn't exist
         profile = UserProfile.objects.create(user=request.user)
-        serializer = UserProfileSerializer(profile)
-        return Response(serializer.data)
+    
+    # Update total_created count
+    profile.total_created = PhotoHunt.objects.filter(created_by=request.user, is_active=True).count()
+    profile.save()
+    
+    serializer = UserProfileSerializer(profile, context={'request': request})
+    return Response(serializer.data)
 
 
 @api_view(['PUT', 'PATCH'])
@@ -415,7 +491,7 @@ def update_profile(request):
     except UserProfile.DoesNotExist:
         profile = UserProfile.objects.create(user=request.user)
     
-    serializer = UserProfileSerializer(profile, data=request.data, partial=True)
+    serializer = UserProfileSerializer(profile, data=request.data, partial=True, context={'request': request})
     if serializer.is_valid():
         serializer.save()
         return Response(serializer.data)
@@ -458,4 +534,120 @@ def nearby_photohunts(request):
     ).order_by('-created_at')
     
     serializer = PhotoHuntSerializer(photohunts, many=True, context={'request': request})
+    return Response(serializer.data)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def change_password(request):
+    """Change user password"""
+    serializer = ChangePasswordSerializer(data=request.data, context={'request': request})
+    if serializer.is_valid():
+        user = request.user
+        user.set_password(serializer.validated_data['new_password'])
+        user.save()
+        return Response({'message': 'Password changed successfully'}, status=status.HTTP_200_OK)
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(['DELETE'])
+@permission_classes([IsAuthenticated])
+def delete_account(request):
+    """Delete user account and all associated data"""
+    user = request.user
+    
+    # Get S3 service for cleanup
+    from .services.s3_service import S3Service
+    s3_service = S3Service()
+    
+    # Collect all S3 objects to delete
+    s3_objects_to_delete = []
+    
+    # Get user's avatar
+    try:
+        profile = user.profile
+        if profile.avatar and (profile.avatar.startswith('http://') or profile.avatar.startswith('https://')):
+            try:
+                key = s3_service.extract_key_from_url(profile.avatar)
+                if key:
+                    s3_objects_to_delete.append(key)
+            except Exception:
+                pass
+    except UserProfile.DoesNotExist:
+        pass
+    
+    # Get all PhotoHunts created by user and their reference images
+    user_photohunts = PhotoHunt.objects.filter(created_by=user)
+    for photohunt in user_photohunts:
+        if photohunt.reference_image and (photohunt.reference_image.startswith('http://') or photohunt.reference_image.startswith('https://')):
+            try:
+                key = s3_service.extract_key_from_url(photohunt.reference_image)
+                if key:
+                    s3_objects_to_delete.append(key)
+            except Exception:
+                pass
+    
+    # Get all completions by this user and their submitted images
+    user_completions = PhotoHuntCompletion.objects.filter(user=user)
+    for completion in user_completions:
+        if completion.submitted_image and (completion.submitted_image.startswith('http://') or completion.submitted_image.startswith('https://')):
+            try:
+                key = s3_service.extract_key_from_url(completion.submitted_image)
+                if key:
+                    s3_objects_to_delete.append(key)
+            except Exception:
+                pass
+    
+    # Get all completions of PhotoHunts created by this user (other users' submissions)
+    completions_of_user_photohunts = PhotoHuntCompletion.objects.filter(photohunt__created_by=user)
+    for completion in completions_of_user_photohunts:
+        if completion.submitted_image and (completion.submitted_image.startswith('http://') or completion.submitted_image.startswith('https://')):
+            try:
+                key = s3_service.extract_key_from_url(completion.submitted_image)
+                if key:
+                    s3_objects_to_delete.append(key)
+            except Exception:
+                pass
+    
+    # Delete S3 objects
+    if s3_objects_to_delete:
+        try:
+            # Remove duplicates
+            s3_objects_to_delete = list(set(s3_objects_to_delete))
+            for key in s3_objects_to_delete:
+                try:
+                    s3_service.s3_client.delete_object(Bucket=s3_service.bucket_name, Key=key)
+                except Exception:
+                    pass  # Continue even if individual deletions fail
+        except Exception:
+            pass  # Continue even if S3 cleanup fails
+    
+    # Delete user (cascade will handle related objects)
+    user.delete()
+    
+    return Response({'message': 'Account deleted successfully'}, status=status.HTTP_200_OK)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def public_user_profile(request, user_id):
+    """Get public profile information for any user"""
+    try:
+        # Get the target user
+        target_user = User.objects.get(id=user_id)
+    except User.DoesNotExist:
+        return Response({'error': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
+    
+    try:
+        # Get the user's profile
+        profile = target_user.profile
+    except UserProfile.DoesNotExist:
+        # Create profile if it doesn't exist (shouldn't happen but safety check)
+        profile = UserProfile.objects.create(user=target_user)
+    
+    # Update the total_created count to ensure accuracy
+    profile.total_created = PhotoHunt.objects.filter(created_by=target_user, is_active=True).count()
+    profile.save()
+    
+    serializer = PublicUserProfileSerializer(profile, context={'request': request})
     return Response(serializer.data)
